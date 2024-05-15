@@ -476,11 +476,11 @@ class HelloAgent(AbstractRLAgent):
         def __init__(self, input_dim, output_dim):
             super().__init__()
             self.layers = nn.Sequential(
-                nn.Linear(input_dim, 64),
+                nn.Linear(input_dim, 144),
                 nn.CELU(),
-                nn.Linear(64, 32),
+                nn.Linear(144, 55),
                 nn.CELU(),
-                nn.Linear(32, output_dim),
+                nn.Linear(55, output_dim),
                 nn.Softmax(dim=-1)
             )
             self.filename = f"models/NN-HelloAgent-{input_dim}-{output_dim}.pt"
@@ -494,13 +494,13 @@ class HelloAgent(AbstractRLAgent):
             print(f"Model saved {self.filename}")
 
         def load_model(self):
-            try:
+            if os.path.exists(self.filename):
                 model_loaded = torch.jit.load(self.filename)
                 print(f"Model loaded from {self.filename}")
                 return model_loaded
-            except FileNotFoundError:
-                print("File not found. Initializing a new model.")
-                return self  # return a new model instance if no saved model exists
+            else:
+                print("File not found. Using the current model instance.")
+                return self  # Use the existing model instance if no saved model exists
 
     def __init__(self, state_size, action_size, info):
         super().__init__(state_size, action_size, info)
