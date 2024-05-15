@@ -9,6 +9,7 @@ from matplotlib.colors import LinearSegmentedColormap
 from abc import ABC, abstractmethod
 from collections import deque
 from pettingzoo.classic import tictactoe_v3
+from typing import List
 
 from mpl_toolkits.mplot3d import Axes3D
 import ipyvolume as ipv
@@ -18,14 +19,19 @@ import seaborn as sns
 import pandas as pd
 import pickle
 
+from torch import autocast
+from torch.distributions import Categorical
 from torchrl.envs.libs import pettingzoo
 
-torch.set_default_dtype(torch.half)
+torch.set_default_dtype(torch.float32)
+if torch.cuda.is_available():
+    torch.set_default_device('cuda')
 
 
 class Environment:
     def __init__(self, size=(21, 21, 21), diff=1, risk_prob=0.1, death_prob=0.01):
         self.size = size  # Grid size, e.g., (100, 100, 100) for 3D
+        self.sz_tensor = torch.tensor(size)
         self.vol = size[0] * size[1] * size[2]
         self.diff = diff  # A difficulty or variability factor
         self.dim = len(size)
@@ -33,7 +39,7 @@ class Environment:
         self.isRiskCluster = True
 
         # main game -> min (time(steps) * total_energy) -> compared with (l2_distance * harmonic_or_mean_or_70_or_max_energy). if agent_score < estimated_score, good. if a_s > e_s, improve. hm7m is param tightened by agent performance
-        # minimize energy = main objective
+        # minimize energy of path -> main objective
         self.energy = torch.clamp(torch.normal(0.2, 0.5, size=self.size), min=0, max=3)
         # cannot transpose to wall, if slip into wall -> terminate , death ,-r
         self.wall = torch.zeros(size)
@@ -42,10 +48,14 @@ class Environment:
         # if death will terminal state, negative reward (-r)
         self.death = torch.mul(self.risk, death_prob)
 
-        self.set_diff()
         self.init_properties()
-        self.map = torch.add(torch.add(self.energy.clone(), self.wall.clone()),
-                             torch.mul(self.death.clone(), self.risk.clone()))
+        # map = not wall(death + energy * risk)) // Energy has been normalised to 0-1
+        self.map = torch.add(
+            torch.mul(
+                (self.energy.clone() * (1 + self.risk.clone()) / self.energy.max()),
+                torch.logical_not(self.wall.clone()).half()
+            ),
+            self.death.clone())
 
     def set_diff(self):
         print(self.vol)
@@ -66,6 +76,8 @@ class Environment:
 
     def init_properties(self):
         # Initialize grids with normal distributions
+        self.diff = np.random.randint(1, 4)
+        self.set_diff()
         volume = reduce(operator.mul, self.size, 1)
         print("INIT: Volume", volume)
         print("INIT: target: ", self.target)
@@ -310,81 +322,117 @@ class Environment:
         return return_stack(loc, len)
 
     def roll(self, location):
-        if self.risk[location] > torch.rand(1):
+        r = torch.rand(1)
+        print("ENV.roll(): ", r, self.index_tensor(self.risk, location))
+
+        if self.index_tensor(self.risk, location) > r:
             return True, self.risk[location]
         else:
             return False, self.risk[location]
 
-    def _get_cell(self, location):
-        return self.risk[location], self.energy[location], self.wall[location], self.death[location]
+    def get_cell_depreciated(self, location):
+        if not torch.is_tensor(location):
+            location = torch.tensor(location)
 
-    def cell_cost(self, location):
-        tuple(self._get_cell(location))
+        print("ENV.get_cell: ", location)
+        clamped_locations = torch.min(location, torch.tensor(self.map.shape) - 1)
+        return (self.energy[clamped_locations],
+                self.risk[clamped_locations],
+                self.wall[clamped_locations],
+                self.death[clamped_locations],
+                self.map[clamped_locations])
+
+    def index_tensor(self, target_tensor, locations):
+        locations = torch.as_tensor(locations)
+
+        # Ensure locations is a 2D tensor
+        if locations.dim() == 1:
+            locations = locations.unsqueeze(0)
+
+        # Clamp locations for each dimension
+        clamped_locations = torch.stack([
+            torch.clamp(locations[:, dim], 0, size - 1)
+            for dim, size in enumerate(target_tensor.shape[:locations.size(1)])
+        ], dim=1)
+
+        # Use advanced indexing to select elements
+        return target_tensor[tuple(clamped_locations.t())]
+
+    def get_cell(self, location):
+
+        # if not torch.is_tensor(location):
+        #    location = torch.tensor(location, dtype=torch.long)
+        location = torch.as_tensor(location)
+        return (self.index_tensor(self.energy, location),
+                self.index_tensor(self.risk, location),
+                self.index_tensor(self.wall, location),
+                self.index_tensor(self.death, location),
+                self.index_tensor(self.map, location))
 
 
-class MiniGame:
-    def __init__(self):
-        self.env = tictactoe_v3.env(render_mode="human")
-        self.env.reset(seed=42)
-        # opt adam or RMSPrompt, Adam dynamic gradient may be bad for pomdp
+class AgentWrapper:
+    def __init__(self, agent, info):
+        self.agent = agent
+        self.team = info['team']
+        self.start_pos = info['current_pos']
+        self.end_pos = info['end_pos']
 
-        for agent in self.env.agent_iter():
-            observation, reward, termination, truncation, info = self.env.last()
+        # Track agent's state, actions, and rewards
+        self.states = []  # Initial state
+        self.location = []
+        self.actions = []
+        self.rewards = []
+        self.violations = []
+        self.total_reward = 0
 
-            if termination or truncation:
-                action = None
-            else:
-                mask = observation["action_mask"]
-                # this is where you would insert your policy
-                action = self.env.action_space(agent).sample(mask)
+    def choose_action(self, state):
+        action = self.agent.choose_action(state)
+        self.actions.append(action)
+        return action
 
-            self.env.step(action)
-        self.env.close()
-        pass
+    def receive_feedback(self, reward, next_state, done):
+        self.rewards.append(reward)
+        self.states.append(next_state)
+        if done:
+            self.episode_end()
+
+    def episode_end(self):
+        # Aggregate rewards and update the model at the end of an episode
+        print(f"AgentWrapper.episode_end: {self.team}")
+        self.total_reward = sum(self.rewards)
+        for i in range(len(self.rewards)):
+            state = self.states[i]
+            action = self.actions[i]
+            reward = self.rewards[i]
+            next_state = self.states[i + 1] if i + 1 < len(self.states) else None
+            done = i == len(self.rewards) - 1
+            self.agent.update_model(state, action, reward, next_state, done)
+
+        self.rewards.clear()
+        self.actions.clear()
+        self.states.clear()
+
+    def review_performance(self):
+        # Method to review performance metrics of the agent
+        print(f"Total reward accumulated in last episode: {self.total_reward}")
 
 
-class Agent(ABC):
-    def __init__(self, start_pos, end_pos, team, action_size, state_size, gamma=0.95, epsilon=1.0, epsilon_decay=0.995,
-                 min_epsilon=0.01, memory_size=10000):
+class AbstractRLAgent(ABC):
+    def __init__(self, state_size, action_size, info):
+        self.current_pos = info['current_pos']
+        self.end_pos = info['end_pos']
+        self.team = info['team']
+
         self.action_size = action_size
         self.state_size = state_size
-        self.memory = deque(maxlen=memory_size)
-        self.gamma = gamma  # Discount factor
-        self.epsilon = epsilon  # Exploration rate
-        self.epsilon_min = min_epsilon
-        self.epsilon_decay = epsilon_decay
-        self.start_pos = start_pos
-        self.current_pos = start_pos
-        self.request_pos = start_pos
-        self.end_pos = end_pos
-        self.team = team
+
+        self.cumulative_reward = 0
         self.history = None
         self.state = None
         self.action = None
 
-    def lyapunov(self):
-        return
-
-    def safety_soft(self, state, action):
-        return action
-
-    def CLF(self):
-        # should assess next worst possible state.
-        # Theorm -> agent in a ok state should not die because of a nudge
-        # like balancing a bottle, bottle at stable state ss should not fall down when k force is applied leading it to state sa or sb, however sc may be dangerous and sf is prohibited.
-        return
-
-    def safety_hard(self, state, action):
-        if violate:
-            return True
-
-        return False
-
-    def expect(self, state, action):
-        return
-
     @abstractmethod
-    def get_action(self, state):
+    def choose_action(self, state):
         """
         Get the action to take based on the current state.
 
@@ -394,7 +442,7 @@ class Agent(ABC):
         Returns:
             An integer representing the chosen action.
         """
-        pass
+        return self.policy.decide(state)
 
     @abstractmethod
     def update_model(self, state, action, reward, next_state, done):
@@ -408,54 +456,130 @@ class Agent(ABC):
             next_state: The state transitioned to after the action.
             done: Boolean indicating if the episode has terminated.
         """
+        # Example learning procedure based on the reward and next state
         pass
 
-    @abstractmethod
-    def train(self):
-        """
-        Train the agent using experiences stored in memory.
-        """
-        pass
+
+class HelloAgent(AbstractRLAgent):
+    class LocalNN(nn.Module):
+        def __init__(self, input_dim, output_dim):
+            super().__init__()
+            self.layers = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.CELU(),
+                nn.Linear(64, 32),
+                nn.CELU(),
+                nn.Linear(32, output_dim),
+                nn.Softmax(dim=-1)
+            )
+            self.filename = f"models/NN-HelloAgent-{input_dim}-{output_dim}.pt"
+
+        def forward(self, x):
+            return self.layers(x)
+
+        def save_model(self):
+            # Saving as TorchScript
+            model_scripted = torch.jit.script(self)
+            model_scripted.save(self.filename)
+            print(f"Model saved {self.filename}")
+
+        def load_model(self):
+            model_loaded = torch.jit.load(self.filename)
+            print(f"Model loaded from {self.filename}")
+            return model_loaded
+
+    # @autocast(device_type=torch.get_default_device())
+    def __init__(self, state_size, action_size, info):
+        super().__init__(state_size, action_size, info)  # Ensuring base class initialization
+        self.model = self.LocalNN(state_size, action_size)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=info['lr'])
+        self.criterion = nn.MSELoss()
+
+        self.epsilon = 0.1
+        self.gamma = 0.99
+
+    def choose_action(self, state):
+        if np.random.rand() < self.epsilon:
+            isrand = True
+            action = np.random.randint(0, self.action_size)
+        else:
+            isrand = False
+            with torch.no_grad():
+                state = torch.tensor(state, dtype=torch.float)
+                q_values = self.model(state)
+                action = torch.argmax(q_values).item()
+        print(f"HelloAgent.choose_action: {action}, RNG:{isrand}")
+        return action
+
+    def update_model(self, state, action, reward, next_state, done):
+        print(f"HelloAgent.update_model: {state}, {action}, {reward}, {next_state}, {not done}")
+        if not done:
+            state = torch.tensor(state, dtype=torch.float)
+            next_state = torch.tensor(next_state, dtype=torch.float)
+            q_values = self.model(state)
+            next_q_values = self.model(next_state)
+
+            max_next_q_value = torch.max(next_q_values).item()
+            target_q_value = reward + self.gamma * max_next_q_value
+
+            loss = self.criterion(q_values[action], target_q_value)
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
 
 class NN(nn.Module):
-    def __init__(self, input, output, mode=0):
-        # https://r-knott.surrey.ac.uk/Fibonacci/fibtable.html
-        if mode == 0:
-            super(NN, self).__init__()
-            self.layer[0] = nn.Linear(input, 610),
-            self.layer[1] = nn.SELU(),
-            self.layer[2] = nn.Linear(610, 377),
-            self.layer[3] = nn.SELU(),
-            self.layer[4] = nn.Linear(377, 144),
-            self.layer[5] = nn.SELU(),
-            self.layer[6] = nn.Linear(144, 233),
-            self.layer[7] = nn.SELU(),
-            self.layer[8] = nn.Linear(233, output),
-            self.layer[9] = nn.Softmax(dim=-1)
-            self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
-        elif mode == 1:
-            # dummy for random
-            pass
+    # https://r-knott.surrey.ac.uk/Fibonacci/fibtable.html
+    def __init__(self, input_dim, output_dim, mode=0):
+        super(NN, self).__init__()
+        self.mode = mode
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+
+        if self.mode == 0:
+            print("NN: ", self.mode)
+            self.layers = nn.Sequential(
+                nn.Linear(input_dim, 610),
+                nn.SELU(),
+                nn.Linear(610, 377),
+                nn.SELU(),
+                nn.Linear(377, 144),
+                nn.SELU(),
+                nn.Linear(144, 233),
+                nn.SELU(),
+                nn.Linear(233, output_dim),
+                nn.Softmax(dim=-1)
+            )
+            self.optimizer = optim.Adam(self.parameters(), lr=0.001)  # Assuming a learning rate is defined
+
+        elif self.mode == 1:
+            # Dummy behavior for random output, could be designed better based on specific requirements
+            self.layers = None
 
     def forward(self, x):
-        pass
+        if self.mode == 0:
+            return self.layers(x)
+        elif self.mode == 1:
+            return torch.rand((x.shape[0], self.output_dim))  # Random tensor with the same batch size as input
 
+    def save_model(self):
+        filename = f"Zeo-NN-{self.mode}-{self.input_dim}-{self.output_dim}.pt"
+        # Saving as TorchScript
+        model_scripted = torch.jit.script(self)
+        model_scripted.save(filename)
+        print(f"Model saved as {filename}")
 
-class PGAAPP(Agent, NN):
-    def __init__(self, start_pos, end_pos, team, policy_type):
-        pass
-
-
-class DQN(Agent, NN):
-    def __init__(self, start_pos, end_pos, team, policy_type):
-        pass
+    def load_model(self, filepath):
+        model_loaded = torch.jit.load(filepath)
+        print(f"Model loaded from {filepath}")
+        return model_loaded
 
 
 class Observer:
     def __init__(self):
         self.env = Environment()
-        self.log = []
+
+        self.agent_step_limit = self.env.vol * self.env.vol
         self.MARL = True
         self.LoadMap = False
         self.LoadNavModel = False
@@ -463,7 +587,260 @@ class Observer:
         self.ResumeNav = False
         self.ResumePvP = False
 
-        # agent = Agent(start_pos=(0, 0), end_pos=(9, 9), environment=self.env, team=1)
+        self.agent_store = []
+        self.log = []
+        self.hard_L = self.env.map.max()
+
+        self.transitions = {
+            0: torch.tensor([2, 0, 0]),
+            1: torch.tensor([-2, 0, 0]),
+            2: torch.tensor([0, 2, 0]),
+            3: torch.tensor([0, -2, 0]),
+            4: torch.tensor([0, 0, 2]),
+            5: torch.tensor([0, 0, -2]),
+            6: torch.tensor([1, 1, 0]),
+            7: torch.tensor([1, -1, 0]),
+            8: torch.tensor([1, 0, 1]),
+            9: torch.tensor([1, 0, -1]),
+            10: torch.tensor([-1, 1, 0]),
+            11: torch.tensor([-1, -1, 0]),
+            12: torch.tensor([-1, 0, 1]),
+            13: torch.tensor([-1, 0, -1]),
+            14: torch.tensor([0, 0, 0])
+            # 15: None # TeleportAgent(exits, distance) - handled by a pointer network, or arm -> prevent slip
+        }
+        self.neighbours = torch.tensor([
+            [2, 0, 0],
+            [-2, 0, 0],
+            [0, 2, 0],
+            [0, -2, 0],
+            [0, 0, 2],
+            [0, 0, -2],
+            [1, 1, 0],
+            [1, -1, 0],
+            [1, 0, 1],
+            [1, 0, -1],
+            [-1, 1, 0],
+            [-1, -1, 0],
+            [-1, 0, 1],
+            [-1, 0, -1],
+            [0, 1, 1],
+            [0, -1, -1],
+            [0, 0, 0]
+        ])
+        self.spawn_agents()
+        # self.current_position = torch.tensor([5, 5, 5])
+
+    def train(self):
+        # Initialization of a training session
+        training_active = True
+        iteration = 0
+        # init agents
+
+        while training_active:
+            iteration += 1
+            all_agents_done = True
+
+            for agent_wrapper in self.agent_store:
+                # Generate the current state for the agent based on its last observed location
+                state = self.observation(
+                    agent_wrapper.location[-1],
+                    agent_wrapper.end_pos,
+                    agent_wrapper.team
+                )
+
+                # Agent[i] chooses an action based on the current state
+                action = agent_wrapper.choose_action(state)
+
+                # Environment processes the action and returns the reward and next observation
+                reward, next_state, terminate = self.step(agent_wrapper, action)
+
+                # Update the agent model based on the action's outcomes
+                agent_wrapper.receive_feedback(reward, next_state, terminate)
+                if not terminate:
+                    all_agents_done = False
+
+            if all_agents_done:
+                print(f"Observer.train(): Training ending at iteration {iteration}")
+                for agent_wrapper in self.agent_store:
+                    agent_wrapper.episode_end()
+
+                if iteration == 1000:
+                    training_active = False
+
+    def step(self, agent, action, safety=True, is_slip_activated=True):
+        """ agent -> AgentWrapper, action -> int """
+        penalty = 0
+
+        next_position = self.transitions[action] + torch.as_tensor(agent.location[-1])
+        valid = self.valid_env_move(newpos=next_position, agent=agent)
+
+        if not valid:
+            agent.violations.append(self.env.get_cell(next_position))
+            print("OBS.step: Invalid Move")
+            terminate = True
+            return (self.reward(agent=agent, loc=next_position, cell=self.env.get_cell(next_position), invalid=True),
+                    self.observation(next_position, agent.end_pos, agent.team),
+                    terminate)
+
+        # apply slip, if true slides to random neighbour even if unsafe
+        if is_slip_activated:
+            roll, risk = self.env.roll(next_position)
+            if roll:
+                old_pos = next_position
+                a = np.random.randint(0, len(self.transitions))
+                next_position = self.transitions[a] + torch.as_tensor(agent.location[-1])
+                valid = self.valid_env_move(newpos=next_position, agent=agent)
+
+                if not valid:
+                    print("OBS.step.slipped: Invalid Move")
+                    terminate = True
+                    return (
+                        self.reward(agent=agent, loc=next_position, cell=self.env.get_cell(next_position),
+                                    invalid=True),
+                        self.observation(next_position, agent.end_pos, agent.team),
+                        terminate)
+
+        # check hard safety constraints
+        if safety and self.l(mode='hard', locations=next_position, intensity=0.99):
+            agent.violations.append(self.env.get_cell(next_position))
+            print("OBS.step: Hard Constraint Violation, seeding next valid move")
+            terminate = False
+            all_indices = list(range(len(self.transitions)))  # Create a list of all possible indices
+            np.random.shuffle(all_indices)  # Shuffle to ensure randomness
+
+            for index in all_indices:  # Iterate over each index only once
+                next_position = self.transitions[index] + agent.location[-1]
+                valid = self.valid_env_move(newpos=next_position, agent=agent)
+                if valid and self.l(mode='hard', locations=next_position, intensity=0.99):
+                    print(f"Valid move found at index {index}, position {next_position}")
+                    break
+
+        # Calculate the reward based on the properties of the cell
+        reward = self.reward(agent, next_position,
+                             self.env.get_cell(next_position),
+                             invalid=terminate,
+                             slip_roll=roll)
+
+        # check hard safety constraints
+
+        # Return the reward and the next observation
+        print("OBS.step.reward: ", reward)
+        next_observation = self.observation(next_position, agent.end_pos, agent.team)
+        return reward, next_observation, terminate
+
+    def reward_old(self, agent, loc, cell, invalid=False, slip_roll=False):
+        energy, risk, wall, death, m = cell
+
+        def objective(agent, loc, m):
+            # Objective function to be minimised
+            # agent -> AgentWrapper, loc -> torch.tensor, m -> torch.tensor
+            # Returns a scalar value representing the objective function
+            return torch.sum(torch.abs(loc - agent.end_pos))
+
+        penalty_invalid = -1
+        penalty_slip = -0.5
+        penalty_death = -1
+
+        if slip_roll:
+            return penalty_slip
+
+        if invalid:
+            return self.l('soft', loc, intensity=0.99)
+
+        return m + self.l('soft', loc, intensity=0.99)
+
+    def reward(self, agent, loc, cell, invalid=False, slip_roll=False, death=False):
+        energy, risk, wall, death_state, m = cell
+        penalty = -m + self.l('soft', loc, intensity=0.99)  # default penalty calculation
+
+        # Apply the penalty adjustments based on conditions
+        if invalid:
+            penalty *= 3
+        if slip_roll:
+            penalty *= 1.6
+        if death or death_state:
+            penalty *= 4
+
+        # Check if the agent reached the end position
+        if torch.equal(agent.end_pos, loc):
+            # Reward the agent based on reaching the target and the safety of the path
+            penalty = -5 * penalty  # Positive reward, 5 times the negated penalty
+            if slip_roll:
+                penalty *= 0.4
+
+            # Calculate distance to end position and apply a logarithmic scale discount
+            distance_to_end = torch.norm(agent.end_pos - loc)
+            max_distance = 2 * torch.prod(self.env.sz_tensor).item()
+            discount_factor = torch.log1p(distance_to_end / max_distance)
+            discount = torch.clamp(discount_factor, max=0.5)
+            penalty *= (1 - discount)  # Apply discount to the reward
+
+        return penalty
+
+    def valid_env_move(self, newpos, agent):
+        # Check if the agent can move in the specified direction
+        energy, risk, wall, death, map = self.env.get_cell(newpos)
+        if wall.max() == 1:
+            print("OBS.valid_env_move: False")
+            return False
+
+        if newpos.min() >= 0 and newpos.max() < self.env.sz_tensor.min():
+            print("OBS.valid_env_move: True")
+            return True
+
+    def CLF(self, locations):
+        # should assess next worst possible state.
+        # Theorm -> agent in a ok state should not die because of a nudge
+        # like balancing a bottle, bottle at stable state ss should not fall down when k force is applied leading it to state sa or sb,
+        # however sc may be dangerous and sf is prohibited.
+        energy, risk, wall, death, map = self.env.get_cell(locations)
+        return
+
+    def l(self, mode, locations, intensity=0.99):
+        q = torch.tensor([0.38, 0.5, 0.62])
+        energy, risk, wall, death, map = self.env.get_cell(locations + self.neighbours)
+        # print("OBS.l: ", energy.shape, risk.shape, wall.shape, death.shape, map.shape)
+        if mode == 'soft':  # reward shaping and considers any next state
+            # energy converges to 0, as min risk = 0
+            # you are now in a "high" region that is not perfered
+            score = (1 + risk.max()) * (1 + energy)
+            score = torch.quantile(score.flatten().float(), q.float())
+            print("OBS.l.soft.tq.score: ", score)
+            score = torch.sum(score)
+            print("OBS.l.soft.score: ", score)
+            return -score
+
+        elif mode == 'hard':  # hard safety rule
+            # Checks next state if death as a hard limit.
+            # Does not allow agent to move to any cell adjacent to death
+            print("OBS.l.hard.bool: d, H*L ||", death.max(), self.hard_L * intensity)
+            if death.max():
+                print("OBS.l.hard.death: True")
+                return True
+
+            if self.hard_L * intensity >= map.max():
+                print("OBS.l.hard.cell_is_too_hard: True")
+                return True
+
+            else:
+                print("OBS.l.hard: False")
+                return False
+
+        # ensure the trajectory converges to stable state,
+        # eg ground state -> energy equlibruim -> some minimizeable state
+        # policy: death=high, risk=high, wall=high
+        # can be returned as something to be minimised in the obj
+        # or operated as a constraint to clamp next possible states
+        # or be used to evaluate all next possible states
+
+        # intensity defines max acceptable state by evaluating worse case
+        # can be clamped by the mean or upper quantile l of l2 path.
+        # mode decides soft, hard, or expect
+        # soft is used for reward shaping, hard is used for constraint, expect is used for evaluation i states
+        # possible to dampen next state based on previous i states
+        # by exposing self to less risk energy state
+        # target can be lower than threshold or dynamic
 
     def plot_space(self, mode):
         if mode == 0:
@@ -526,7 +903,7 @@ class Observer:
     def plot_features(self, len=3):
         # Obtain data from your environment function
         tensors = self.env.env_global_features(len)
-        print("features.shape is: ", tensors.shape)
+        print("OBS.plot_features.shape is: ", tensors.shape)
         # Determine the number of properties and scenarios dynamically
         num_properties, num_scenarios, _, _ = tensors.shape  # Assume shape is [num_properties, num_scenarios, 10, 10]
 
@@ -550,8 +927,10 @@ class Observer:
         plt.tight_layout()  # Adjust subplots to fit into figure area.
         plt.show()  # Show the plot
 
-    def observation(self, location, target, obs=3, k=3):
+    def observation(self, location, target, team, obs=3, k=3):
         # Method to build obs for NAVagent
+        print("OBS: L, T = ", location, target)
+
         def obs_map(loc, obs, k):
             # 21 * 21 obs 441 pooled by k=3 to 49
             mean_egf = F.avg_pool2d(self.env.env_global_features(len=obs), kernel_size=k, stride=k)
@@ -563,19 +942,78 @@ class Observer:
             return torch.cat([mean_egf.flatten(), tensor_map.flatten()])
 
         def obs_nav(location, target):
+            if not torch.is_tensor(location):
+                location = torch.tensor(location)
+
+                # Check if 'target' is a tensor, convert if not
+            if not torch.is_tensor(target):
+                target = torch.tensor(target)
+
             # builds the relative properties for the NN, eg abs distance from target
             return torch.cat([torch.tensor(location == target).flatten(),
                               torch.tensor(target - location).flatten()])
 
-        return torch.cat([obs_map(location, obs, k), obs_nav(torch.tensor(location), torch.tensor(target))])
+        return torch.cat([obs_map(location, obs, k), obs_nav(torch.tensor(location), target)])
 
-    def train(self):
-        # trains agents
-        # assign Policy, Agent pairs
-        #
-        return
+    def spawn_agents_old(self):
+        # state_space = sample reading from the environment
+        def randpos():
+            return torch.tensor([np.random.randint(0, self.env.map.size - 1) for _ in range(self.env.dim)])
+
+        state_space = self.observation(location=torch.tensor([2, 2, 2]),
+                                       target=torch.tensor([19, 19, 19]),
+                                       team=0).shape[0]
+
+        cfg_helloagent = {
+            'lr': 1e-3,
+            'criterion': nn.MSELoss,
+            'epsilon': 0.1,
+            'current_pos': randpos(),
+            'end_pos': randpos(),
+            'team': len(self.agent_store),
+            'state': self.observation()
+        }
+
+        self.agent_store.append(
+            AgentWrapper(HelloAgent(state_size=state_space,
+                                    action_size=len(self.transitions),
+                                    info=cfg_helloagent
+                                    ), {'team': 0, 'start': torch.tensor([2, 2, 2]), 'end': [19, 19, 19]}))
+
+        print("Observer.spawn_agents(): AgentStore | ", len(self.agent_store))
+
+    def spawn_agents(self):
+        def rand_2pos():
+            return torch.tensor([np.random.randint(0, self.env.size[0] - 1) for _ in self.env.map.size()]), torch.tensor([np.random.randint(0, self.env.size[0] - 1) for _ in self.env.map.size()])
+
+        # Randomly generate start and end positions
+        spawn_pos, end_pos = rand_2pos()
+        cfg_helloagent = {
+            'lr': 1e-3,
+            'criterion': nn.MSELoss,
+            'epsilon': 0.1,
+            'current_pos': spawn_pos,
+            'end_pos': end_pos,
+            'team': len(self.agent_store),  # Incremental team assignment
+            'state': self.observation(spawn_pos, end_pos, len(self.agent_store))
+        }
+
+        # Append agent with the first state observation
+        state_space = cfg_helloagent['state'].shape[0]
+        agent = HelloAgent(state_size=state_space,
+                           action_size=len(self.transitions),
+                           info=cfg_helloagent)
+        agent_wrapper = AgentWrapper(agent, cfg_helloagent)
+
+        # Initialize with first state
+        agent_wrapper.states.append(cfg_helloagent['state'])
+        agent_wrapper.location.append(spawn_pos)
+
+        self.agent_store.append(agent_wrapper)
+        print("Observer.spawn_agents(): AgentStore | ", len(self.agent_store))
 
     def review(self):
+        # load torchscripts for agents
 
         # snapshot environment
         return
@@ -592,4 +1030,7 @@ if __name__ == "__main__":
     # obs.plot_space(2)
     # obs.plot_space(3)
     # obs.plot_space(4)
-    obs.plot_features(5)
+    # obs.plot_features(5)
+    # obs.env.get_cell([5, 5, 5])
+
+    obs.train()
