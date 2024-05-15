@@ -1,3 +1,8 @@
+import datetime
+import os
+
+print(datetime.datetime.now())
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -8,7 +13,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 from abc import ABC, abstractmethod
 from collections import deque
-from pettingzoo.classic import tictactoe_v3
+#from pettingzoo.classic import tictactoe_v3
 from typing import List
 
 from mpl_toolkits.mplot3d import Axes3D
@@ -21,12 +26,15 @@ import pickle
 
 from torch import autocast
 from torch.distributions import Categorical
-from torchrl.envs.libs import pettingzoo
+from torch.utils.tensorboard import SummaryWriter
+
+#from torchrl.envs.libs import pettingzoo
 
 torch.set_default_dtype(torch.float32)
 if torch.cuda.is_available():
     torch.set_default_device('cuda')
 
+DEBUG = False
 
 class Environment:
     def __init__(self, size=(21, 21, 21), diff=1, risk_prob=0.1, death_prob=0.01):
@@ -56,6 +64,9 @@ class Environment:
                 torch.logical_not(self.wall.clone()).half()
             ),
             self.death.clone())
+
+        self.reward = torch.zeros(size)
+        self.l_score = torch.zeros(size)
 
     def set_diff(self):
         print(self.vol)
@@ -370,53 +381,6 @@ class Environment:
                 self.index_tensor(self.map, location))
 
 
-class AgentWrapper:
-    def __init__(self, agent, info):
-        self.agent = agent
-        self.team = info['team']
-        self.start_pos = info['current_pos']
-        self.end_pos = info['end_pos']
-
-        # Track agent's state, actions, and rewards
-        self.states = []  # Initial state
-        self.location = []
-        self.actions = []
-        self.rewards = []
-        self.violations = []
-        self.total_reward = 0
-
-    def choose_action(self, state):
-        action = self.agent.choose_action(state)
-        self.actions.append(action)
-        return action
-
-    def receive_feedback(self, reward, next_state, done):
-        self.rewards.append(reward)
-        self.states.append(next_state)
-        if done:
-            self.episode_end()
-
-    def episode_end(self):
-        # Aggregate rewards and update the model at the end of an episode
-        print(f"AgentWrapper.episode_end: {self.team}")
-        self.total_reward = sum(self.rewards)
-        for i in range(len(self.rewards)):
-            state = self.states[i]
-            action = self.actions[i]
-            reward = self.rewards[i]
-            next_state = self.states[i + 1] if i + 1 < len(self.states) else None
-            done = i == len(self.rewards) - 1
-            self.agent.update_model(state, action, reward, next_state, done)
-
-        self.rewards.clear()
-        self.actions.clear()
-        self.states.clear()
-
-    def review_performance(self):
-        # Method to review performance metrics of the agent
-        print(f"Total reward accumulated in last episode: {self.total_reward}")
-
-
 class AbstractRLAgent(ABC):
     def __init__(self, state_size, action_size, info):
         self.current_pos = info['current_pos']
@@ -460,7 +424,54 @@ class AbstractRLAgent(ABC):
         pass
 
 
-class HelloAgent(AbstractRLAgent):
+class AgentWrapper:
+    def __init__(self, agent, info):
+        self.agent = agent
+        self.team = info['team']
+        self.start_pos = info['current_pos']
+        self.end_pos = info['end_pos']
+
+        # Track agent's state, actions, and rewards
+        self.states = []  # Initial state
+        self.location = []
+        self.actions = []
+        self.rewards = []
+        self.violations = []
+        self.total_reward = 0
+
+    def choose_action(self, state):
+        action = self.agent.choose_action(state)
+        self.actions.append(action)
+        return action
+
+    def receive_feedback(self, reward, next_state, done):
+        self.rewards.append(reward)
+        self.states.append(next_state)
+        if DEBUG:
+            print(f"AgentWrapper.receive_feedback: {self.team}, {reward}, {next_state}, {done}")
+
+    def episode_end(self):
+        # Aggregate rewards and update the model at the end of an episode
+        print(f"AgentWrapper.episode_end: {self.team}, rewards: {sum(self.rewards)}")
+        self.total_reward = sum(self.rewards)
+        for i in range(len(self.rewards)):
+            state = self.states[i]
+            action = self.actions[i]
+            reward = self.rewards[i]
+            next_state = self.states[i + 1] if i + 1 < len(self.states) else None
+            done = i == len(self.rewards) - 1
+            self.agent.update_model(state, action, reward, next_state, done)
+
+        self.rewards.clear()
+        self.actions.clear()
+        self.states.clear()
+
+    def review_performance(self):
+        # Method to review performance metrics of the agent
+        print(f"Total reward accumulated in last episode: {self.total_reward}")
+
+
+"""class GoodbyeAgent(AbstractRLAgent):
     class LocalNN(nn.Module):
         def __init__(self, input_dim, output_dim):
             super().__init__()
@@ -492,11 +503,20 @@ class HelloAgent(AbstractRLAgent):
     def __init__(self, state_size, action_size, info):
         super().__init__(state_size, action_size, info)  # Ensuring base class initialization
         self.model = self.LocalNN(state_size, action_size)
+        self.writer = SummaryWriter(log_dir=f'logs/{datetime.datetime.now()}')
+        # load model if exists
+        try:
+            self.model = self.model.load_model()
+        except:
+            print("HelloAgent: Model not loaded")
+            pass
+        self.writer = SummaryWriter()
         self.optimizer = optim.Adam(self.model.parameters(), lr=info['lr'])
         self.criterion = nn.MSELoss()
 
         self.epsilon = 0.1
         self.gamma = 0.99
+        self.done_count = 0
 
     def choose_action(self, state):
         if np.random.rand() < self.epsilon:
@@ -508,10 +528,14 @@ class HelloAgent(AbstractRLAgent):
                 state = torch.tensor(state, dtype=torch.float)
                 q_values = self.model(state)
                 action = torch.argmax(q_values).item()
-        print(f"HelloAgent.choose_action: {action}, RNG:{isrand}")
+
+        if DEBUG:
+            print(f"HelloAgent.choose_action: {action}, RNG:{isrand}")
         return action
 
     def update_model(self, state, action, reward, next_state, done):
+        self.done_count += 1
+        # if DEBUG:
         print(f"HelloAgent.update_model: {state}, {action}, {reward}, {next_state}, {not done}")
         if not done:
             state = torch.tensor(state, dtype=torch.float)
@@ -526,6 +550,87 @@ class HelloAgent(AbstractRLAgent):
             self.optimizer.zero_grad()
             loss.backward()
             self.optimizer.step()
+            self.writer.add_scalar("Loss", loss.item(), self.done_count)
+            self.writer.add_scalar("Max Next Q Value", max_next_q_value, self.done_count)
+
+            # Log Q-values as histograms
+            self.writer.add_histogram("Q-values", q_values.detach().numpy(), self.done_count)
+
+            # Log network parameters
+            for name, param in self.model.named_parameters():
+                self.writer.add_histogram(f"{name}", param.clone().cpu().data.numpy(), self.done_count)
+"""
+
+class HelloAgent(AbstractRLAgent):
+    class LocalNN(nn.Module):
+        def __init__(self, input_dim, output_dim):
+            super().__init__()
+            self.layers = nn.Sequential(
+                nn.Linear(input_dim, 64),
+                nn.CELU(),
+                nn.Linear(64, 32),
+                nn.CELU(),
+                nn.Linear(32, output_dim),
+                nn.Softmax(dim=-1)
+            )
+            self.filename = f"models/NN-HelloAgent-{input_dim}-{output_dim}.pt"
+
+        def forward(self, x):
+            return self.layers(x)
+
+        def save_model(self):
+            model_scripted = torch.jit.script(self)
+            model_scripted.save(self.filename)
+            print(f"Model saved {self.filename}")
+
+        def load_model(self):
+            try:
+                model_loaded = torch.jit.load(self.filename)
+                print(f"Model loaded from {self.filename}")
+                return model_loaded
+            except FileNotFoundError:
+                print("File not found. Initializing a new model.")
+                return self  # return a new model instance if no saved model exists
+
+    def __init__(self, state_size, action_size, info):
+        super().__init__(state_size, action_size, info)
+        self.model = self.LocalNN(state_size, action_size)
+        self.model = self.model.load_model()
+        self.writer = SummaryWriter(log_dir=f'logs/{datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
+        self.optimizer = optim.Adam(self.model.parameters(), lr=info['lr'])
+        self.criterion = nn.MSELoss()
+        self.epsilon = 0.1
+        self.gamma = 0.99
+        self.done_count = 0
+
+    def choose_action(self, state):
+        if np.random.rand() < self.epsilon:
+            isrand = True
+            action = np.random.randint(0, self.action_size)
+        else:
+            isrand = False
+            state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+            q_values = self.model(state)
+            action = torch.argmax(q_values).item()
+        return action
+
+    def update_model(self, state, action, reward, next_state, done):
+        self.done_count += 1
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        next_state = torch.tensor(next_state, dtype=torch.float).unsqueeze(0) if next_state is not None else None
+        q_values = self.model(state)
+        next_q_values = self.model(next_state)
+        max_next_q_value = torch.max(next_q_values).item()
+        target_q_value = reward + self.gamma * max_next_q_value
+        loss = self.criterion(q_values[0, action], torch.tensor([target_q_value]))
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.writer.add_scalar("Loss", loss.item(), self.done_count)
+        self.writer.add_scalar("Max Next Q Value", max_next_q_value, self.done_count)
+        self.writer.add_histogram("Q-values", q_values.detach().numpy(), self.done_count)
+        for name, param in self.model.named_parameters():
+            self.writer.add_histogram(f"{name}", param.clone().cpu().data.numpy(), self.done_count)
 
 
 class NN(nn.Module):
@@ -782,11 +887,13 @@ class Observer:
         # Check if the agent can move in the specified direction
         energy, risk, wall, death, map = self.env.get_cell(newpos)
         if wall.max() == 1:
-            print("OBS.valid_env_move: False")
+            if DEBUG:
+                print("OBS.valid_env_move: False")
             return False
 
         if newpos.min() >= 0 and newpos.max() < self.env.sz_tensor.min():
-            print("OBS.valid_env_move: True")
+            if DEBUG:
+                print("OBS.valid_env_move: True")
             return True
 
     def CLF(self, locations):
@@ -806,15 +913,19 @@ class Observer:
             # you are now in a "high" region that is not perfered
             score = (1 + risk.max()) * (1 + energy)
             score = torch.quantile(score.flatten().float(), q.float())
-            print("OBS.l.soft.tq.score: ", score)
+            if DEBUG:
+                print("OBS.l.soft.tq.score: ", -score)
             score = torch.sum(score)
-            print("OBS.l.soft.score: ", score)
+            if DEBUG:
+                ("OBS.l.soft.score: ", -score)
             return -score
 
         elif mode == 'hard':  # hard safety rule
             # Checks next state if death as a hard limit.
             # Does not allow agent to move to any cell adjacent to death
-            print("OBS.l.hard.bool: d, H*L ||", death.max(), self.hard_L * intensity)
+            if DEBUG:
+                print("OBS.l.hard.bool: d, H*L ||", death.max(), self.hard_L * intensity)
+
             if death.max():
                 print("OBS.l.hard.death: True")
                 return True
@@ -876,6 +987,22 @@ class Observer:
             ipv.figure()
             ipv.volshow(self.env.map, opacity=0.05, level_width=0.1, data_min=self.env.map.min(),
                         data_max=self.env.map.max())
+            ipv.show()
+
+        if mode == 5:
+            self.populate_reward_tensor()
+            print("env.reward: ", self.env.reward.min(), self.env.reward.mean(), self.env.reward.max())
+            ipv.figure()
+            ipv.volshow(self.env.reward, opacity=0.05, level_width=0.1, data_min=self.env.reward.min(),
+                        data_max=self.env.reward.max())
+            ipv.show()
+
+        if mode == 6:
+            self.populate_l_tensor()
+            print("env.l: ", self.env.l_score.min(), self.env.l_score.mean(), self.env.l_score.max())
+            ipv.figure()
+            ipv.volshow(self.env.l_score, opacity=0.05, level_width=0.1, data_min=self.env.l_score.min(),
+                        data_max=self.env.l_score.max())
             ipv.show()
 
     def plot_slice(self, mode, loc=[14, 14, 7], r=7):
@@ -955,41 +1082,16 @@ class Observer:
 
         return torch.cat([obs_map(location, obs, k), obs_nav(torch.tensor(location), target)])
 
-    def spawn_agents_old(self):
-        # state_space = sample reading from the environment
-        def randpos():
-            return torch.tensor([np.random.randint(0, self.env.map.size - 1) for _ in range(self.env.dim)])
-
-        state_space = self.observation(location=torch.tensor([2, 2, 2]),
-                                       target=torch.tensor([19, 19, 19]),
-                                       team=0).shape[0]
-
-        cfg_helloagent = {
-            'lr': 1e-3,
-            'criterion': nn.MSELoss,
-            'epsilon': 0.1,
-            'current_pos': randpos(),
-            'end_pos': randpos(),
-            'team': len(self.agent_store),
-            'state': self.observation()
-        }
-
-        self.agent_store.append(
-            AgentWrapper(HelloAgent(state_size=state_space,
-                                    action_size=len(self.transitions),
-                                    info=cfg_helloagent
-                                    ), {'team': 0, 'start': torch.tensor([2, 2, 2]), 'end': [19, 19, 19]}))
-
-        print("Observer.spawn_agents(): AgentStore | ", len(self.agent_store))
-
     def spawn_agents(self):
         def rand_2pos():
-            return torch.tensor([np.random.randint(0, self.env.size[0] - 1) for _ in self.env.map.size()]), torch.tensor([np.random.randint(0, self.env.size[0] - 1) for _ in self.env.map.size()])
+            return torch.tensor(
+                [np.random.randint(0, self.env.size[0] - 1) for _ in self.env.map.size()]), torch.tensor(
+                [np.random.randint(0, self.env.size[0] - 1) for _ in self.env.map.size()])
 
         # Randomly generate start and end positions
         spawn_pos, end_pos = rand_2pos()
         cfg_helloagent = {
-            'lr': 1e-3,
+            'lr': 1e-2,
             'criterion': nn.MSELoss,
             'epsilon': 0.1,
             'current_pos': spawn_pos,
@@ -1008,8 +1110,8 @@ class Observer:
         # Initialize with first state
         agent_wrapper.states.append(cfg_helloagent['state'])
         agent_wrapper.location.append(spawn_pos)
-
         self.agent_store.append(agent_wrapper)
+
         print("Observer.spawn_agents(): AgentStore | ", len(self.agent_store))
 
     def review(self):
