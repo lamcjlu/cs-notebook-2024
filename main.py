@@ -660,12 +660,12 @@ class Observer:
                 if not terminate:
                     all_agents_done = False
 
-            if all_agents_done:
+            if all_agents_done or iteration == 100:
                 print(f"Observer.train(): Training ending at iteration {iteration}")
                 for agent_wrapper in self.agent_store:
                     agent_wrapper.episode_end()
 
-                if iteration == 1000:
+                if iteration == 100:
                     training_active = False
 
     def step(self, agent, action, safety=True, is_slip_activated=True):
