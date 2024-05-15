@@ -471,96 +471,6 @@ class AgentWrapper:
         print(f"Total reward accumulated in last episode: {self.total_reward}")
 
 
-"""class GoodbyeAgent(AbstractRLAgent):
-    class LocalNN(nn.Module):
-        def __init__(self, input_dim, output_dim):
-            super().__init__()
-            self.layers = nn.Sequential(
-                nn.Linear(input_dim, 64),
-                nn.CELU(),
-                nn.Linear(64, 32),
-                nn.CELU(),
-                nn.Linear(32, output_dim),
-                nn.Softmax(dim=-1)
-            )
-            self.filename = f"models/NN-HelloAgent-{input_dim}-{output_dim}.pt"
-
-        def forward(self, x):
-            return self.layers(x)
-
-        def save_model(self):
-            # Saving as TorchScript
-            model_scripted = torch.jit.script(self)
-            model_scripted.save(self.filename)
-            print(f"Model saved {self.filename}")
-
-        def load_model(self):
-            model_loaded = torch.jit.load(self.filename)
-            print(f"Model loaded from {self.filename}")
-            return model_loaded
-
-    # @autocast(device_type=torch.get_default_device())
-    def __init__(self, state_size, action_size, info):
-        super().__init__(state_size, action_size, info)  # Ensuring base class initialization
-        self.model = self.LocalNN(state_size, action_size)
-        self.writer = SummaryWriter(log_dir=f'logs/{datetime.datetime.now()}')
-        # load model if exists
-        try:
-            self.model = self.model.load_model()
-        except:
-            print("HelloAgent: Model not loaded")
-            pass
-        self.writer = SummaryWriter()
-        self.optimizer = optim.Adam(self.model.parameters(), lr=info['lr'])
-        self.criterion = nn.MSELoss()
-
-        self.epsilon = 0.1
-        self.gamma = 0.99
-        self.done_count = 0
-
-    def choose_action(self, state):
-        if np.random.rand() < self.epsilon:
-            isrand = True
-            action = np.random.randint(0, self.action_size)
-        else:
-            isrand = False
-            with torch.no_grad():
-                state = torch.tensor(state, dtype=torch.float)
-                q_values = self.model(state)
-                action = torch.argmax(q_values).item()
-
-        if DEBUG:
-            print(f"HelloAgent.choose_action: {action}, RNG:{isrand}")
-        return action
-
-    def update_model(self, state, action, reward, next_state, done):
-        self.done_count += 1
-        # if DEBUG:
-        print(f"HelloAgent.update_model: {state}, {action}, {reward}, {next_state}, {not done}")
-        if not done:
-            state = torch.tensor(state, dtype=torch.float)
-            next_state = torch.tensor(next_state, dtype=torch.float)
-            q_values = self.model(state)
-            next_q_values = self.model(next_state)
-
-            max_next_q_value = torch.max(next_q_values).item()
-            target_q_value = reward + self.gamma * max_next_q_value
-
-            loss = self.criterion(q_values[action], target_q_value)
-            self.optimizer.zero_grad()
-            loss.backward()
-            self.optimizer.step()
-            self.writer.add_scalar("Loss", loss.item(), self.done_count)
-            self.writer.add_scalar("Max Next Q Value", max_next_q_value, self.done_count)
-
-            # Log Q-values as histograms
-            self.writer.add_histogram("Q-values", q_values.detach().numpy(), self.done_count)
-
-            # Log network parameters
-            for name, param in self.model.named_parameters():
-                self.writer.add_histogram(f"{name}", param.clone().cpu().data.numpy(), self.done_count)
-"""
-
 class HelloAgent(AbstractRLAgent):
     class LocalNN(nn.Module):
         def __init__(self, input_dim, output_dim):
@@ -614,12 +524,12 @@ class HelloAgent(AbstractRLAgent):
             action = torch.argmax(q_values).item()
         return action
 
-    def update_model(self, state, action, reward, next_state, done):
+    """def update_model(self, state, action, reward, next_state, done):
         self.done_count += 1
         state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
         next_state = torch.tensor(next_state, dtype=torch.float).unsqueeze(0) if next_state is not None else None
         q_values = self.model(state)
-        next_q_values = self.model(next_state)
+        next_q_values = self.model(next_state) if next_state is not None else torch.tensor([-1])
         max_next_q_value = torch.max(next_q_values).item()
         target_q_value = reward + self.gamma * max_next_q_value
         loss = self.criterion(q_values[0, action], torch.tensor([target_q_value]))
@@ -628,6 +538,32 @@ class HelloAgent(AbstractRLAgent):
         self.optimizer.step()
         self.writer.add_scalar("Loss", loss.item(), self.done_count)
         self.writer.add_scalar("Max Next Q Value", max_next_q_value, self.done_count)
+        self.writer.add_histogram("Q-values", q_values.detach().numpy(), self.done_count)
+        for name, param in self.model.named_parameters():
+            self.writer.add_histogram(f"{name}", param.clone().cpu().data.numpy(), self.done_count)
+"""
+    def update_model(self, state, action, reward, next_state, done):
+        self.done_count += 1
+        state = torch.tensor(state, dtype=torch.float).unsqueeze(0)
+        q_values = self.model(state)
+        q_value = q_values[0, action]
+
+        if not done:
+            next_state = torch.tensor(next_state, dtype=torch.float).unsqueeze(0)
+            next_q_values = self.model(next_state)
+            max_next_q_value = torch.max(next_q_values).item()
+            target_q_value = reward + self.gamma * max_next_q_value
+        else:
+            # If done is True, there are no future states, and the future reward is 0
+            target_q_value = reward
+
+        loss = self.criterion(q_value, torch.tensor([target_q_value]))
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.writer.add_scalar("Loss", loss.item(), self.done_count)
+        self.writer.add_scalar("Max Next Q Value", max_next_q_value if not done else 0, self.done_count)
         self.writer.add_histogram("Q-values", q_values.detach().numpy(), self.done_count)
         for name, param in self.model.named_parameters():
             self.writer.add_histogram(f"{name}", param.clone().cpu().data.numpy(), self.done_count)
@@ -765,13 +701,12 @@ class Observer:
                 if not terminate:
                     all_agents_done = False
 
-            if all_agents_done or iteration == 100:
+            if all_agents_done or iteration == 300000:
                 print(f"Observer.train(): Training ending at iteration {iteration}")
                 for agent_wrapper in self.agent_store:
                     agent_wrapper.episode_end()
 
-                if iteration == 100:
-                    training_active = False
+                training_active = False
 
     def step(self, agent, action, safety=True, is_slip_activated=True):
         """ agent -> AgentWrapper, action -> int """
@@ -1056,7 +991,8 @@ class Observer:
 
     def observation(self, location, target, team, obs=3, k=3):
         # Method to build obs for NAVagent
-        print("OBS: L, T = ", location, target)
+        if DEBUG:
+            print("OBS: L, T = ", location, target)
 
         def obs_map(loc, obs, k):
             # 21 * 21 obs 441 pooled by k=3 to 49
@@ -1126,7 +1062,6 @@ class Observer:
 
 
 if __name__ == "__main__":
-    obs = Observer()
     # obs.plot_space(0)
     # obs.plot_space(1)
     # obs.plot_space(2)
@@ -1134,5 +1069,8 @@ if __name__ == "__main__":
     # obs.plot_space(4)
     # obs.plot_features(5)
     # obs.env.get_cell([5, 5, 5])
+    for i in range(10000):
+        if i % 500 == 0:
+            obs = Observer()
+        obs.train()
 
-    obs.train()
